@@ -379,28 +379,65 @@ def train(cfg: TrainConfig) -> None:
         batch_size=cfg.micro_batch,
     )
 
-    def refill_buffer(target: int) -> None:
+    def add_tokens(n_tokens: int) -> None:
+        """Fetch new sequences from the stream and add their activations.
+
+        Runs micro-batches through the frozen model and appends the
+        resulting per-token activations to the ring buffer. Unlike a
+        'ready' check this always pulls fresh tokens — critical for
+        avoiding buffer memorization (see README smoke-test notes).
+        """
+        added = 0
+        while added < n_tokens:
+            try:
+                enc = next(stream)
+            except StopIteration:
+                return
+            acts = extract_hidden_states(model, enc, cfg.layer, device)
+            if acts.numel() == 0:
+                continue
+            buf.extend(acts)
+            added += acts.shape[0]
+
+    def fill_buffer_to(target: int) -> None:
+        """Fill buffer until it has at least ``target`` tokens."""
         while not buf.ready(target):
             try:
                 enc = next(stream)
             except StopIteration:
                 return
             acts = extract_hidden_states(model, enc, cfg.layer, device)
-            buf.extend(acts)
+            if acts.numel() > 0:
+                buf.extend(acts)
 
-    # Initial fill
-    print(f"[sae] Filling activation buffer to {cfg.batch_size * 4} tokens...")
-    refill_buffer(cfg.batch_size * 4)
+    # Initial fill: pack the buffer reasonably full so the first batches
+    # see diverse tokens. Target = min(buffer capacity, 10% of capacity
+    # or batch_size * 16, whichever is larger).
+    initial_target = min(
+        cfg.buffer_capacity,
+        max(cfg.buffer_capacity // 10, cfg.batch_size * 16),
+    )
+    print(f"[sae] Filling activation buffer to {initial_target} tokens...")
+    fill_buffer_to(initial_target)
 
     print(f"[sae] Starting training: {cfg.total_steps} steps, "
           f"{cfg.batch_size} tokens/step, {cfg.tokens / 1e6:.1f} M total tokens")
 
     t0 = time.time()
     step = 0
+    # Refresh rate: how many fresh tokens to stream in per 1 token trained.
+    # Value ~0.5 means the buffer is turned over every 2 epochs — enough to
+    # prevent memorization without starving throughput.
+    refresh_rate = 0.5
+    refresh_interval = 25  # steps
+    tokens_per_refresh = int(cfg.batch_size * refresh_rate * refresh_interval)
+
     while step < cfg.total_steps:
-        # Refill buffer periodically
-        if step % 50 == 0:
-            refill_buffer(cfg.batch_size * 2)
+        # ALWAYS stream fresh tokens every `refresh_interval` steps.
+        # This is critical — without it the buffer memorizes and var_exp
+        # spuriously hits 1.0.
+        if step > 0 and step % refresh_interval == 0:
+            add_tokens(tokens_per_refresh)
 
         x = buf.sample_batch(cfg.batch_size)
         recon, acts = sae(x)
@@ -430,12 +467,13 @@ def train(cfg: TrainConfig) -> None:
             steps_per_sec = (step + 1) / max(1.0, elapsed)
             eta_min = (cfg.total_steps - step) / max(1e-6, steps_per_sec) / 60.0
             with torch.no_grad():
-                var_explained = 1.0 - (mse.item() / x.var().item())
+                var_explained = 1.0 - (mse.item() / max(x.var().item(), 1e-9))
                 n_dead = int(dead_mask.sum().item())
+                aux_val = aux.detach().item() if aux.requires_grad else float(aux)
             print(
                 f"[sae] step {step:>6}/{cfg.total_steps} "
                 f"mse={mse.item():.4f} var_exp={var_explained:.3f} "
-                f"aux={float(aux):.4f} dead={n_dead} "
+                f"aux={aux_val:.4f} dead={n_dead} "
                 f"lr={scheduler.get_last_lr()[0]:.2e} "
                 f"eta={eta_min:.1f}min",
                 flush=True,

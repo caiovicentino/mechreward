@@ -332,6 +332,7 @@ class TrainConfig:
     save_every: int = 2000
     seed: int = 42
     bf16_model: bool = True
+    resume: str | None = None          # path to sae_resume.pt to continue from
 
     @property
     def total_steps(self) -> int:
@@ -429,6 +430,24 @@ def train(cfg: TrainConfig) -> None:
         min_frac=cfg.lr_min_frac,
     )
 
+    # Resume path: if a previous snapshot exists, load SAE+optim+scheduler
+    # state *before* initializing the activation buffer. On successful resume
+    # we also skip the b_dec geometric median init (it was already done in
+    # the original run).
+    resume_step = 0
+    resume_elapsed = 0.0
+    resumed = False
+    if cfg.resume:
+        resume_path = Path(cfg.resume)
+        if not resume_path.exists():
+            raise FileNotFoundError(
+                f"--resume path does not exist: {resume_path}"
+            )
+        resume_step, resume_elapsed = load_resume_state(
+            resume_path, sae, cfg, optim, scheduler, device
+        )
+        resumed = True
+
     buf = HiddenStateBuffer(d_model=d_model, capacity=cfg.buffer_capacity, device=device)
     stream = stream_tokens(
         cfg.dataset,
@@ -497,7 +516,8 @@ def train(cfg: TrainConfig) -> None:
 
     # Initialize b_dec with geometric median of a fresh sample. Gao et al.
     # 2024 show this cuts initial reconstruction error by 30-50%.
-    if cfg.init_bdec_from_sample:
+    # Skip on resume — the loaded b_dec is already trained.
+    if cfg.init_bdec_from_sample and not resumed:
         init_sample = buf.sample_batch(cfg.bdec_init_sample)
         print(
             f"[sae] Initializing b_dec via geometric median over "
@@ -506,6 +526,11 @@ def train(cfg: TrainConfig) -> None:
         sae.init_b_dec_from_sample(init_sample)
         print(
             f"[sae]   b_dec norm after init: {sae.b_dec.norm().item():.4f}"
+        )
+    elif resumed:
+        print(
+            f"[sae]   b_dec carried over from checkpoint "
+            f"(norm={sae.b_dec.norm().item():.4f})"
         )
 
     print(f"[sae] Starting training: {cfg.total_steps} steps, "
@@ -518,8 +543,10 @@ def train(cfg: TrainConfig) -> None:
         f"buffer={cfg.buffer_capacity:,}"
     )
 
-    t0 = time.time()
-    step = 0
+    # Keep wall-clock consistent with prior runs when resuming so ETA math
+    # stays accurate and the log lines read "elapsed X min" not "0 min".
+    t0 = time.time() - resume_elapsed
+    step = resume_step
     # Refresh rate: how many fresh tokens to stream in per 1 token trained.
     # Value ~0.5 means the buffer is turned over every 2 epochs — enough to
     # prevent memorization without starving throughput.
@@ -582,7 +609,16 @@ def train(cfg: TrainConfig) -> None:
             )
 
         if step > 0 and step % cfg.save_every == 0:
-            save_checkpoint(sae, cfg, step)
+            save_resume_state(
+                sae, cfg, step, optim, scheduler,
+                elapsed=time.time() - t0,
+            )
+            # Echo briefly so logs show saves happening
+            print(
+                f"[sae] Saved resume snapshot at step {step} "
+                f"(elapsed {(time.time() - t0) / 60.0:.1f} min)",
+                flush=True,
+            )
 
         step += 1
 
@@ -627,6 +663,147 @@ def save_checkpoint(sae: TopKSAE, cfg: TrainConfig, step: int, final: bool = Fal
         json.dump(meta, f, indent=2)
 
     print(f"[sae] Saved checkpoint to {ckpt_path}")
+
+
+def save_resume_state(
+    sae: TopKSAE,
+    cfg: TrainConfig,
+    step: int,
+    optim: torch.optim.Optimizer,
+    scheduler: LambdaLR,
+    elapsed: float,
+) -> None:
+    """Write a full training snapshot for crash-proof resume.
+
+    Writes a single file ``sae_resume.pt`` in ``cfg.output_dir`` atomically
+    (tmp + rename) so a dying process cannot leave a corrupt checkpoint.
+    Overwrites the previous snapshot on every call — we only ever need the
+    latest one. Historical inspection points use ``sae_stepN.pt`` files
+    written separately.
+
+    Contents: SAE parameters, optimizer state dict, scheduler state dict,
+    per-feature dead-feature tracker, RNG state, step counter, wall-time
+    elapsed, and a ``meta`` block recording the hyperparameters that must
+    match on resume.
+    """
+    tmp_path = cfg.output_dir / "sae_resume.tmp"
+    final_path = cfg.output_dir / "sae_resume.pt"
+
+    payload = {
+        # SAE weights (same keys as sae_final.pt for inspection compatibility)
+        "W_enc": sae.W_enc.detach().cpu(),
+        "W_dec": sae.W_dec.detach().cpu(),
+        "b_enc": sae.b_enc.detach().cpu(),
+        "b_dec": sae.b_dec.detach().cpu(),
+        "d_model": sae.d_model,
+        "d_sae": sae.d_sae,
+        "k": sae.k,
+        # Training state for resume
+        "step": int(step),
+        "elapsed": float(elapsed),
+        "optim_state": optim.state_dict(),
+        "scheduler_state": scheduler.state_dict(),
+        "last_active_step": sae.last_active_step.detach().cpu(),
+        "rng_state": torch.get_rng_state(),
+        "cuda_rng_state": (
+            torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+        ),
+        # Hyperparameter meta — verified on load to catch silent mismatches
+        "meta": {
+            "model": cfg.model,
+            "layer": cfg.layer,
+            "d_sae": cfg.d_sae,
+            "k": cfg.k,
+            "k_aux": cfg.k_aux,
+            "tokens": cfg.tokens,
+            "lr": cfg.lr,
+            "batch_size": cfg.batch_size,
+            "warmup_steps": cfg.warmup_steps,
+            "lr_min_frac": cfg.lr_min_frac,
+            "aux_coef": cfg.aux_coef,
+            "decoder_norm_every": cfg.decoder_norm_every,
+            "dead_threshold_steps": cfg.dead_threshold_steps,
+            "total_steps": cfg.total_steps,
+        },
+    }
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, final_path)
+
+
+def load_resume_state(
+    path: Path,
+    sae: TopKSAE,
+    cfg: TrainConfig,
+    optim: torch.optim.Optimizer,
+    scheduler: LambdaLR,
+    device: str,
+) -> tuple[int, float]:
+    """Restore a full training snapshot previously written by ``save_resume_state``.
+
+    Returns ``(step, elapsed)`` — the step count and wall-clock time already
+    consumed, so the training loop can continue from exactly where it was
+    interrupted and the ETA estimate stays accurate.
+
+    Aborts with a clear error if the saved meta hyperparameters differ from
+    the current ``cfg`` in any way that would make the resume unsafe
+    (e.g. different total_steps, different k, different d_sae).
+    """
+    print(f"[sae] Loading resume checkpoint from {path}")
+    state = torch.load(path, map_location="cpu", weights_only=False)
+
+    # Verify critical hyperparameters match
+    meta = state.get("meta", {})
+    critical = [
+        "d_sae", "k", "k_aux", "tokens", "batch_size",
+        "warmup_steps", "lr_min_frac", "total_steps",
+    ]
+    mismatches = []
+    cfg_snapshot = {
+        "d_sae": cfg.d_sae, "k": cfg.k, "k_aux": cfg.k_aux,
+        "tokens": cfg.tokens, "batch_size": cfg.batch_size,
+        "warmup_steps": cfg.warmup_steps, "lr_min_frac": cfg.lr_min_frac,
+        "total_steps": cfg.total_steps,
+    }
+    for key in critical:
+        saved = meta.get(key)
+        current = cfg_snapshot.get(key)
+        if saved is not None and saved != current:
+            mismatches.append(f"{key}: saved={saved} vs current={current}")
+    if mismatches:
+        raise RuntimeError(
+            "Resume checkpoint hyperparameters do not match current run:\n  "
+            + "\n  ".join(mismatches)
+            + "\nTo resume, pass the same CLI flags as the original run."
+        )
+
+    # Restore SAE weights (shape-checked via torch .data assignment)
+    sae.W_enc.data.copy_(state["W_enc"].to(device))
+    sae.W_dec.data.copy_(state["W_dec"].to(device))
+    sae.b_enc.data.copy_(state["b_enc"].to(device))
+    sae.b_dec.data.copy_(state["b_dec"].to(device))
+    sae.last_active_step = state["last_active_step"].to(device)
+
+    # Restore optimizer — move any internal tensors to device
+    optim.load_state_dict(state["optim_state"])
+    for opt_state in optim.state.values():
+        for k, v in opt_state.items():
+            if isinstance(v, torch.Tensor):
+                opt_state[k] = v.to(device)
+
+    scheduler.load_state_dict(state["scheduler_state"])
+
+    torch.set_rng_state(state["rng_state"])
+    if state.get("cuda_rng_state") is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state(state["cuda_rng_state"])
+
+    step = int(state["step"])
+    elapsed = float(state.get("elapsed", 0.0))
+    print(
+        f"[sae] Resumed at step {step}/{cfg.total_steps} "
+        f"({100.0 * step / cfg.total_steps:.1f}%), "
+        f"{elapsed / 60.0:.1f} min already elapsed"
+    )
+    return step, elapsed
 
 
 def upload_to_hf(cfg: TrainConfig) -> None:
@@ -677,7 +854,7 @@ def parse_args() -> TrainConfig:
     p.add_argument("--dead-threshold-steps", type=int, default=5000)
     p.add_argument("--aux-coef", type=float, default=1.0 / 8.0,
                    help="Weight of the dead-feature revival aux loss. Default 1/8 "
-                        "(was 1/32 originally). Increase if dead% stays >25% at convergence.")
+                        "(was 1/32 originally). Increase if dead%% stays >25%% at convergence.")
     p.add_argument("--decoder-norm-every", type=int, default=10,
                    help="Re-normalize W_dec rows every N steps. Default 10.")
     p.add_argument("--buffer-capacity", type=int, default=2_000_000)
@@ -695,6 +872,15 @@ def parse_args() -> TrainConfig:
     p.add_argument("--save-every", type=int, default=2000)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--no-bf16", action="store_true", help="Force fp32 model (slower)")
+    p.add_argument(
+        "--resume",
+        default=None,
+        help="Path to a sae_resume.pt checkpoint to continue training from. "
+             "Restores SAE weights, optimizer state, LR schedule position, "
+             "dead-feature tracker, and RNG state. Key hyperparams (d_sae, k, "
+             "warmup_steps, total_steps, lr, lr_min_frac) must match the "
+             "original run or loading will abort.",
+    )
     args = p.parse_args()
 
     return TrainConfig(
@@ -724,6 +910,7 @@ def parse_args() -> TrainConfig:
         save_every=args.save_every,
         seed=args.seed,
         bf16_model=not args.no_bf16,
+        resume=args.resume,
     )
 
 

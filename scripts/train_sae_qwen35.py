@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+"""Train a TopK Sparse Autoencoder on Qwen3.5 hidden states.
+
+This is a self-contained training script that DOES NOT depend on sae_lens
+or TransformerLens, because Qwen3.5 (architecture ``qwen3_5``, a hybrid
+GDN) isn't supported by TransformerLens yet. We extract activations with
+plain HF forward hooks.
+
+Algorithm: TopK SAE (Gao et al. 2024, arxiv:2406.04093). Much simpler
+than JumpReLU, within 1-2 pp of the same reconstruction quality, and
+extremely stable to train.
+
+Target: ship the FIRST public SAE for Qwen3.5 architecture.
+
+Usage (local or Colab):
+
+    python3 scripts/train_sae_qwen35.py \\
+        --model Qwen/Qwen3.5-4B \\
+        --layer 18 \\
+        --d-sae 40960 \\
+        --k 64 \\
+        --tokens 200_000_000 \\
+        --output-dir ./sae_qwen35_4b_L18 \\
+        --hf-repo caiovicentino/Qwen3.5-4B-SAE-L18-topk
+
+Memory budget (Qwen3.5-4B, d_sae=40960, bf16 model, fp32 SAE):
+  - Model (frozen):   ~8 GB
+  - SAE params:       ~0.8 GB
+  - Adam optimizer:   ~1.6 GB
+  - Batch activations: small
+  - Total VRAM:       ~12-14 GB  (fits T4 16GB, L4 24GB, A100 40GB)
+
+Dataset: FineWeb-Edu sample-10BT by default (streaming, no download needed).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterator
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim.lr_scheduler import LambdaLR
+
+
+# ---------------------------------------------------------------------------
+# TopK SAE
+# ---------------------------------------------------------------------------
+
+
+class TopKSAE(nn.Module):
+    """Sparse autoencoder with TopK activation (Gao et al. 2024).
+
+    Keeps only the top ``k`` activations per token; everything else is zero.
+    This gives L0 = k by construction, so no L1 tuning needed.
+    """
+
+    def __init__(self, d_model: int, d_sae: int, k: int, dtype: torch.dtype = torch.float32):
+        super().__init__()
+        self.d_model = d_model
+        self.d_sae = d_sae
+        self.k = k
+
+        # Pre-decoder bias (center the input)
+        self.b_dec = nn.Parameter(torch.zeros(d_model, dtype=dtype))
+
+        # Encoder
+        self.W_enc = nn.Parameter(torch.empty(d_model, d_sae, dtype=dtype))
+        self.b_enc = nn.Parameter(torch.zeros(d_sae, dtype=dtype))
+
+        # Decoder (init tied to encoder transpose, then trained freely)
+        self.W_dec = nn.Parameter(torch.empty(d_sae, d_model, dtype=dtype))
+
+        self._init_weights()
+
+        # For dead-feature tracking
+        self.register_buffer("last_active_step", torch.zeros(d_sae, dtype=torch.long))
+
+    def _init_weights(self) -> None:
+        # Kaiming-style init, then normalize decoder rows to unit norm
+        nn.init.kaiming_uniform_(self.W_enc, a=math.sqrt(5))
+        with torch.no_grad():
+            self.W_dec.data = self.W_enc.data.T.clone().contiguous()
+            self.W_dec.data /= self.W_dec.data.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [..., d_model] → acts: [..., d_sae] with L0 = k."""
+        x_centered = x - self.b_dec
+        pre = x_centered @ self.W_enc + self.b_enc  # [..., d_sae]
+
+        # TopK
+        topk_vals, topk_idx = torch.topk(pre, self.k, dim=-1)
+        acts = torch.zeros_like(pre)
+        acts.scatter_(-1, topk_idx, topk_vals)
+
+        # ReLU to enforce non-negativity (matches Gao et al.)
+        return F.relu(acts)
+
+    def decode(self, acts: torch.Tensor) -> torch.Tensor:
+        """acts: [..., d_sae] → recon: [..., d_model]."""
+        return acts @ self.W_dec + self.b_dec
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        acts = self.encode(x)
+        recon = self.decode(acts)
+        return recon, acts
+
+    @torch.no_grad()
+    def normalize_decoder(self) -> None:
+        """Re-project W_dec rows to the unit sphere (standard SAE trick)."""
+        norms = self.W_dec.data.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        self.W_dec.data /= norms
+
+
+def aux_loss_dead_features(
+    sae: TopKSAE,
+    hidden: torch.Tensor,
+    dead_mask: torch.Tensor,
+    k_aux: int,
+) -> torch.Tensor:
+    """Gao et al. auxiliary loss: revive dead features with a second TopK.
+
+    Applied on features that have not activated for N steps. We run an
+    independent TopK over only those features and optimize their
+    reconstruction of the residual error from the main SAE.
+    """
+    if not dead_mask.any() or k_aux == 0:
+        return hidden.new_zeros(())
+
+    with torch.no_grad():
+        _, acts = sae(hidden)
+        main_recon = sae.decode(acts)
+        residual = hidden - main_recon
+
+    # Pre-activations on dead features only
+    x_centered = hidden - sae.b_dec
+    pre = x_centered @ sae.W_enc + sae.b_enc
+    dead_pre = pre.masked_fill(~dead_mask.unsqueeze(0), float("-inf"))
+
+    k_use = min(k_aux, int(dead_mask.sum().item()))
+    if k_use == 0:
+        return hidden.new_zeros(())
+
+    topk_vals, topk_idx = torch.topk(dead_pre, k_use, dim=-1)
+    aux_acts = torch.zeros_like(pre)
+    aux_acts.scatter_(-1, topk_idx, F.relu(topk_vals))
+
+    aux_recon = aux_acts @ sae.W_dec
+    return F.mse_loss(aux_recon, residual)
+
+
+# ---------------------------------------------------------------------------
+# Activation capture
+# ---------------------------------------------------------------------------
+
+
+class HiddenStateBuffer:
+    """Fills up a rolling buffer of activations from a target layer."""
+
+    def __init__(self, d_model: int, capacity: int, device: str | torch.device):
+        self.capacity = capacity
+        self.buffer = torch.zeros((capacity, d_model), dtype=torch.float32, device=device)
+        self.write_pos = 0
+        self.filled = False
+
+    def extend(self, acts: torch.Tensor) -> None:
+        """acts: [N, d_model]"""
+        n = acts.shape[0]
+        if n == 0:
+            return
+        # Convert to fp32 for stability
+        acts = acts.to(self.buffer.dtype)
+        end = self.write_pos + n
+        if end <= self.capacity:
+            self.buffer[self.write_pos : end] = acts
+        else:
+            first = self.capacity - self.write_pos
+            self.buffer[self.write_pos :] = acts[:first]
+            self.buffer[: n - first] = acts[first:]
+            self.filled = True
+        self.write_pos = end % self.capacity
+        if end >= self.capacity:
+            self.filled = True
+
+    def sample_batch(self, batch_size: int) -> torch.Tensor:
+        """Randomly sample a batch from the buffer."""
+        size = self.capacity if self.filled else self.write_pos
+        if size < batch_size:
+            idx = torch.randint(0, max(1, size), (batch_size,), device=self.buffer.device)
+        else:
+            idx = torch.randint(0, size, (batch_size,), device=self.buffer.device)
+        return self.buffer[idx]
+
+    def ready(self, min_size: int) -> bool:
+        size = self.capacity if self.filled else self.write_pos
+        return size >= min_size
+
+
+def stream_tokens(
+    dataset_name: str,
+    dataset_config: str | None,
+    tokenizer,
+    max_length: int,
+    batch_size: int,
+) -> Iterator[dict[str, torch.Tensor]]:
+    """Infinite iterator of tokenized batches from a streaming HF dataset."""
+    from datasets import load_dataset
+
+    ds = load_dataset(
+        dataset_name,
+        dataset_config,
+        split="train",
+        streaming=True,
+    )
+
+    buf: list[str] = []
+    for sample in ds:
+        text = sample.get("text") or sample.get("content") or ""
+        if not text:
+            continue
+        buf.append(text)
+        if len(buf) >= batch_size:
+            enc = tokenizer(
+                buf,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+            )
+            yield enc
+            buf = []
+
+
+@torch.inference_mode()
+def extract_hidden_states(
+    model,
+    enc: dict[str, torch.Tensor],
+    layer_idx: int,
+    device: str,
+) -> torch.Tensor:
+    """Run model forward and return flattened hidden states at ``layer_idx``.
+
+    Returns a ``[N, d_model]`` tensor where N is the number of
+    non-padding tokens across the batch.
+    """
+    input_ids = enc["input_ids"].to(device)
+    attention_mask = enc["attention_mask"].to(device)
+    out = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        output_hidden_states=True,
+        use_cache=False,
+        return_dict=True,
+    )
+    # hidden_states is (num_layers + 1) tensors of shape [B, T, d_model]
+    # hidden_states[0] is the embedding, hidden_states[i] is after layer i-1.
+    # We want the output after layer ``layer_idx`` — that's index layer_idx + 1.
+    hidden = out.hidden_states[layer_idx + 1]
+
+    mask = attention_mask.bool()
+    return hidden[mask]  # [N, d_model]
+
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TrainConfig:
+    model: str = "Qwen/Qwen3.5-4B"
+    layer: int = 18
+    d_sae: int = 40960
+    k: int = 64
+    k_aux: int = 256
+    tokens: int = 200_000_000
+    lr: float = 5e-4
+    batch_size: int = 4096  # tokens per SAE step
+    micro_batch: int = 8   # sequences per model forward
+    max_length: int = 512
+    warmup_steps: int = 1000
+    decoder_norm_every: int = 100
+    dead_threshold_steps: int = 500
+    aux_coef: float = 1.0 / 32.0
+    buffer_capacity: int = 500_000
+    dataset: str = "HuggingFaceFW/fineweb-edu"
+    dataset_config: str = "sample-10BT"
+    output_dir: Path = field(default_factory=lambda: Path("./sae_qwen35_output"))
+    hf_repo: str | None = None
+    hf_token: str | None = None
+    log_every: int = 25
+    save_every: int = 2000
+    seed: int = 42
+    bf16_model: bool = True
+
+    @property
+    def total_steps(self) -> int:
+        return max(1, self.tokens // self.batch_size)
+
+
+def build_model(cfg: TrainConfig, device: str):
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(cfg.model, trust_remote_code=True)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+
+    dtype = torch.bfloat16 if cfg.bf16_model else torch.float32
+    try:
+        from transformers import AutoModelForImageTextToText
+
+        model = AutoModelForImageTextToText.from_pretrained(
+            cfg.model, dtype=dtype, trust_remote_code=True
+        )
+    except Exception:
+        model = AutoModelForCausalLM.from_pretrained(
+            cfg.model, dtype=dtype, trust_remote_code=True
+        )
+    model = model.to(device)
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad = False
+
+    # Sniff d_model
+    cfg_attr = getattr(model, "config", None)
+    text_cfg = getattr(cfg_attr, "text_config", cfg_attr)
+    d_model = getattr(text_cfg, "hidden_size", None)
+    if d_model is None:
+        d_model = getattr(cfg_attr, "hidden_size", 2560)
+
+    num_layers = getattr(text_cfg, "num_hidden_layers", None) or getattr(
+        cfg_attr, "num_hidden_layers", 32
+    )
+    if cfg.layer >= num_layers:
+        raise ValueError(f"layer={cfg.layer} >= num_hidden_layers={num_layers}")
+
+    return model, tok, d_model
+
+
+def cosine_with_warmup(optimizer, warmup_steps: int, total_steps: int) -> LambdaLR:
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return step / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+
+    return LambdaLR(optimizer, lr_lambda)
+
+
+def train(cfg: TrainConfig) -> None:
+    torch.manual_seed(cfg.seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device != "cuda":
+        print("WARNING: training SAE on CPU will be impossibly slow.")
+
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[sae] Loading {cfg.model} on {device}")
+    model, tok, d_model = build_model(cfg, device)
+    print(f"[sae] d_model = {d_model}, target layer = {cfg.layer}")
+
+    sae = TopKSAE(d_model=d_model, d_sae=cfg.d_sae, k=cfg.k).to(device)
+    print(f"[sae] SAE params: {sum(p.numel() for p in sae.parameters()) / 1e6:.1f} M")
+
+    optim = torch.optim.Adam(sae.parameters(), lr=cfg.lr, betas=(0.9, 0.999))
+    scheduler = cosine_with_warmup(optim, cfg.warmup_steps, cfg.total_steps)
+
+    buf = HiddenStateBuffer(d_model=d_model, capacity=cfg.buffer_capacity, device=device)
+    stream = stream_tokens(
+        cfg.dataset,
+        cfg.dataset_config,
+        tok,
+        max_length=cfg.max_length,
+        batch_size=cfg.micro_batch,
+    )
+
+    def refill_buffer(target: int) -> None:
+        while not buf.ready(target):
+            try:
+                enc = next(stream)
+            except StopIteration:
+                return
+            acts = extract_hidden_states(model, enc, cfg.layer, device)
+            buf.extend(acts)
+
+    # Initial fill
+    print(f"[sae] Filling activation buffer to {cfg.batch_size * 4} tokens...")
+    refill_buffer(cfg.batch_size * 4)
+
+    print(f"[sae] Starting training: {cfg.total_steps} steps, "
+          f"{cfg.batch_size} tokens/step, {cfg.tokens / 1e6:.1f} M total tokens")
+
+    t0 = time.time()
+    step = 0
+    while step < cfg.total_steps:
+        # Refill buffer periodically
+        if step % 50 == 0:
+            refill_buffer(cfg.batch_size * 2)
+
+        x = buf.sample_batch(cfg.batch_size)
+        recon, acts = sae(x)
+        mse = F.mse_loss(recon, x)
+
+        # Dead-feature tracking
+        active_now = (acts.sum(dim=0) > 0)
+        sae.last_active_step[active_now] = step
+        dead_mask = (step - sae.last_active_step) > cfg.dead_threshold_steps
+        if dead_mask.any() and cfg.aux_coef > 0:
+            aux = aux_loss_dead_features(sae, x, dead_mask, cfg.k_aux)
+        else:
+            aux = x.new_zeros(())
+
+        loss = mse + cfg.aux_coef * aux
+        optim.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(sae.parameters(), 1.0)
+        optim.step()
+        scheduler.step()
+
+        if step % cfg.decoder_norm_every == 0:
+            sae.normalize_decoder()
+
+        if step % cfg.log_every == 0:
+            elapsed = time.time() - t0
+            steps_per_sec = (step + 1) / max(1.0, elapsed)
+            eta_min = (cfg.total_steps - step) / max(1e-6, steps_per_sec) / 60.0
+            with torch.no_grad():
+                var_explained = 1.0 - (mse.item() / x.var().item())
+                n_dead = int(dead_mask.sum().item())
+            print(
+                f"[sae] step {step:>6}/{cfg.total_steps} "
+                f"mse={mse.item():.4f} var_exp={var_explained:.3f} "
+                f"aux={float(aux):.4f} dead={n_dead} "
+                f"lr={scheduler.get_last_lr()[0]:.2e} "
+                f"eta={eta_min:.1f}min",
+                flush=True,
+            )
+
+        if step > 0 and step % cfg.save_every == 0:
+            save_checkpoint(sae, cfg, step)
+
+        step += 1
+
+    save_checkpoint(sae, cfg, step, final=True)
+    print(f"[sae] Training complete. Total time: {(time.time() - t0) / 60:.1f} min")
+
+    if cfg.hf_repo:
+        upload_to_hf(cfg)
+
+
+def save_checkpoint(sae: TopKSAE, cfg: TrainConfig, step: int, final: bool = False) -> None:
+    suffix = "final" if final else f"step{step}"
+    ckpt_path = cfg.output_dir / f"sae_{suffix}.pt"
+    meta_path = cfg.output_dir / f"sae_{suffix}.json"
+
+    torch.save(
+        {
+            "W_enc": sae.W_enc.detach().cpu(),
+            "W_dec": sae.W_dec.detach().cpu(),
+            "b_enc": sae.b_enc.detach().cpu(),
+            "b_dec": sae.b_dec.detach().cpu(),
+            "d_model": sae.d_model,
+            "d_sae": sae.d_sae,
+            "k": sae.k,
+            "step": step,
+        },
+        ckpt_path,
+    )
+
+    meta = {
+        "d_model": sae.d_model,
+        "d_sae": sae.d_sae,
+        "k": sae.k,
+        "model": cfg.model,
+        "layer": cfg.layer,
+        "tokens_trained": step * cfg.batch_size,
+        "algorithm": "topk",
+        "training_script": "mechreward/scripts/train_sae_qwen35.py",
+        "trained_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+    }
+    with meta_path.open("w") as f:
+        json.dump(meta, f, indent=2)
+
+    print(f"[sae] Saved checkpoint to {ckpt_path}")
+
+
+def upload_to_hf(cfg: TrainConfig) -> None:
+    from huggingface_hub import HfApi, create_repo
+
+    token = cfg.hf_token or os.environ.get("HF_TOKEN")
+    if not token:
+        print("[sae] No HF_TOKEN set; skipping upload.")
+        return
+
+    try:
+        create_repo(cfg.hf_repo, token=token, exist_ok=True)
+    except Exception as e:
+        print(f"[sae] create_repo warning: {e}")
+
+    api = HfApi()
+    for path in sorted(cfg.output_dir.glob("*")):
+        api.upload_file(
+            path_or_fileobj=str(path),
+            path_in_repo=path.name,
+            repo_id=cfg.hf_repo,
+            token=token,
+        )
+    print(f"[sae] Uploaded to https://huggingface.co/{cfg.hf_repo}")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def parse_args() -> TrainConfig:
+    p = argparse.ArgumentParser(description="Train a TopK SAE on Qwen3.5 hidden states")
+    p.add_argument("--model", default="Qwen/Qwen3.5-4B")
+    p.add_argument("--layer", type=int, default=18)
+    p.add_argument("--d-sae", type=int, default=40960)
+    p.add_argument("--k", type=int, default=64)
+    p.add_argument("--k-aux", type=int, default=256)
+    p.add_argument("--tokens", type=int, default=200_000_000)
+    p.add_argument("--lr", type=float, default=5e-4)
+    p.add_argument("--batch-size", type=int, default=4096)
+    p.add_argument("--micro-batch", type=int, default=8)
+    p.add_argument("--max-length", type=int, default=512)
+    p.add_argument("--warmup-steps", type=int, default=1000)
+    p.add_argument("--buffer-capacity", type=int, default=500_000)
+    p.add_argument("--dataset", default="HuggingFaceFW/fineweb-edu")
+    p.add_argument("--dataset-config", default="sample-10BT")
+    p.add_argument("--output-dir", type=Path, default=Path("./sae_qwen35_output"))
+    p.add_argument("--hf-repo", default=None, help="Optional HF repo to upload the final SAE")
+    p.add_argument("--hf-token", default=None)
+    p.add_argument("--log-every", type=int, default=25)
+    p.add_argument("--save-every", type=int, default=2000)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--no-bf16", action="store_true", help="Force fp32 model (slower)")
+    args = p.parse_args()
+
+    return TrainConfig(
+        model=args.model,
+        layer=args.layer,
+        d_sae=args.d_sae,
+        k=args.k,
+        k_aux=args.k_aux,
+        tokens=args.tokens,
+        lr=args.lr,
+        batch_size=args.batch_size,
+        micro_batch=args.micro_batch,
+        max_length=args.max_length,
+        warmup_steps=args.warmup_steps,
+        buffer_capacity=args.buffer_capacity,
+        dataset=args.dataset,
+        dataset_config=args.dataset_config,
+        output_dir=args.output_dir,
+        hf_repo=args.hf_repo,
+        hf_token=args.hf_token,
+        log_every=args.log_every,
+        save_every=args.save_every,
+        seed=args.seed,
+        bf16_model=not args.no_bf16,
+    )
+
+
+if __name__ == "__main__":
+    train(parse_args())

@@ -1,0 +1,33 @@
+{
+  "name": "qwen3.5-4b/reasoning_pack",
+  "version": "0.1.0",
+  "model_name": "Qwen/Qwen3.5-4B",
+  "release": "mechreward/qwen3.5-4b-topk",
+  "sae_id": "layer_18",
+  "description": "Candidate reasoning features for Qwen3.5-4B at residual stream layer 18. The SAE is trained by scripts/train_sae_qwen35.py — the first public SAE for the Qwen3.5 architecture. Features here are PLACEHOLDERS until the training run completes and auto-interp + validator produces real labels. Run mechreward.features.validator.validate_feature() against every entry before using this pack in a training run.",
+  "features": [
+    {
+      "feature_id": 0,
+      "name": "placeholder_until_trained",
+      "description": "Placeholder entry. Will be replaced by real features after the SAE training run completes. See scripts/train_sae_qwen35.py and notebooks/train_qwen35_4b_sae.ipynb.",
+      "weight": 0.0,
+      "release": "mechreward/qwen3.5-4b-topk",
+      "sae_id": "layer_18",
+      "activation_threshold": 0.0,
+      "validated": false,
+      "metadata": {
+        "status": "awaiting_training",
+        "next_action": "Run train_sae_qwen35.py with --tokens 200000000 and re-run auto-interp."
+      }
+    }
+  ],
+  "metadata": {
+    "architecture": "qwen3_5",
+    "d_model": 2560,
+    "num_hidden_layers": 32,
+    "target_layer": 18,
+    "training_recipe": "TopK SAE, k=64, d_sae=40960, 200M tokens from FineWeb-Edu",
+    "status": "awaiting_training_run",
+    "contact": "https://github.com/caiovicentino/mechreward"
+  }
+}

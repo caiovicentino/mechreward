@@ -316,6 +316,7 @@ class TrainConfig:
     micro_batch: int = 8               # sequences per model forward
     max_length: int = 512
     warmup_steps: int = 5000           # was 1000 — longer warmup stabilizes features
+    lr_min_frac: float = 0.3           # cosine decay floor: final LR = peak * min_frac
     decoder_norm_every: int = 10       # was 100 — per Gao et al., stabilizes training
     dead_threshold_steps: int = 5000   # was 500 — be more patient before marking dead
     aux_coef: float = 1.0 / 8.0        # was 1/32 — 4× stronger revival gradient
@@ -376,12 +377,32 @@ def build_model(cfg: TrainConfig, device: str):
     return model, tok, d_model
 
 
-def cosine_with_warmup(optimizer, warmup_steps: int, total_steps: int) -> LambdaLR:
+def cosine_with_warmup(
+    optimizer,
+    warmup_steps: int,
+    total_steps: int,
+    min_frac: float = 0.1,
+) -> LambdaLR:
+    """Cosine schedule with a floor, so the revival phase keeps enough LR.
+
+    Args:
+        optimizer: the torch optimizer
+        warmup_steps: linear warmup duration
+        total_steps: total training steps
+        min_frac: LR floor as a fraction of peak LR (e.g. 0.1 = 10%).
+            Cosine decays from 1.0 → min_frac instead of 1.0 → 0.0.
+            Critical for SAE training: the dead-feature aux loss needs
+            LR > ~5e-5 to sustain revival, and cosine-to-zero drops
+            below that threshold in the last third of training, undoing
+            revival work.
+    """
     def lr_lambda(step: int) -> float:
         if step < warmup_steps:
             return step / max(1, warmup_steps)
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+        # Interpolate between 1.0 (start) and min_frac (end) via cosine
+        return min_frac + (1.0 - min_frac) * cosine
 
     return LambdaLR(optimizer, lr_lambda)
 
@@ -401,7 +422,12 @@ def train(cfg: TrainConfig) -> None:
     print(f"[sae] SAE params: {sum(p.numel() for p in sae.parameters()) / 1e6:.1f} M")
 
     optim = torch.optim.Adam(sae.parameters(), lr=cfg.lr, betas=(0.9, 0.999))
-    scheduler = cosine_with_warmup(optim, cfg.warmup_steps, cfg.total_steps)
+    scheduler = cosine_with_warmup(
+        optim,
+        warmup_steps=cfg.warmup_steps,
+        total_steps=cfg.total_steps,
+        min_frac=cfg.lr_min_frac,
+    )
 
     buf = HiddenStateBuffer(d_model=d_model, capacity=cfg.buffer_capacity, device=device)
     stream = stream_tokens(
@@ -486,6 +512,7 @@ def train(cfg: TrainConfig) -> None:
           f"{cfg.batch_size} tokens/step, {cfg.tokens / 1e6:.1f} M total tokens")
     print(
         f"[sae] Config: k={sae.k} d_sae={sae.d_sae} lr={cfg.lr} "
+        f"lr_min={cfg.lr * cfg.lr_min_frac:.2e} "
         f"warmup={cfg.warmup_steps} dead_thresh={cfg.dead_threshold_steps} "
         f"aux_coef={cfg.aux_coef:.4f} dec_norm_every={cfg.decoder_norm_every} "
         f"buffer={cfg.buffer_capacity:,}"
@@ -644,6 +671,9 @@ def parse_args() -> TrainConfig:
     p.add_argument("--micro-batch", type=int, default=8)
     p.add_argument("--max-length", type=int, default=512)
     p.add_argument("--warmup-steps", type=int, default=5000)
+    p.add_argument("--lr-min-frac", type=float, default=0.3,
+                   help="LR floor as fraction of peak (cosine decays 1.0 → min_frac). "
+                        "Default 0.3 prevents revival collapse in the last third of training.")
     p.add_argument("--dead-threshold-steps", type=int, default=5000)
     p.add_argument("--aux-coef", type=float, default=1.0 / 8.0,
                    help="Weight of the dead-feature revival aux loss. Default 1/8 "
@@ -679,6 +709,7 @@ def parse_args() -> TrainConfig:
         micro_batch=args.micro_batch,
         max_length=args.max_length,
         warmup_steps=args.warmup_steps,
+        lr_min_frac=args.lr_min_frac,
         dead_threshold_steps=args.dead_threshold_steps,
         aux_coef=args.aux_coef,
         decoder_norm_every=args.decoder_norm_every,

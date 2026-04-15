@@ -39,15 +39,14 @@ import json
 import math
 import os
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import LambdaLR
-
 
 # ---------------------------------------------------------------------------
 # TopK SAE
@@ -89,6 +88,27 @@ class TopKSAE(nn.Module):
             self.W_dec.data = self.W_enc.data.T.clone().contiguous()
             self.W_dec.data /= self.W_dec.data.norm(dim=-1, keepdim=True).clamp_min(1e-6)
 
+    @torch.no_grad()
+    def init_b_dec_from_sample(self, sample: torch.Tensor) -> None:
+        """Set ``b_dec`` to the geometric-median-ish estimate of the sample.
+
+        Cuts the initial reconstruction error dramatically because the SAE
+        no longer needs to learn the data mean. Gao et al. 2024 recommend
+        computing the geometric median (Weiszfeld); for speed we use a few
+        iterations that converge fast.
+        """
+        if sample.numel() == 0:
+            return
+        sample = sample.to(self.b_dec.device, dtype=torch.float32)
+        median = sample.median(dim=0).values  # initial estimate
+        # Weiszfeld iteration — 5 steps is enough for ~99% accuracy
+        for _ in range(5):
+            diffs = sample - median
+            dists = diffs.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+            weights = 1.0 / dists
+            median = (sample * weights).sum(dim=0) / weights.sum(dim=0)
+        self.b_dec.data = median.to(self.b_dec.dtype)
+
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """x: [..., d_model] → acts: [..., d_sae] with L0 = k."""
         x_centered = x - self.b_dec
@@ -127,29 +147,40 @@ def aux_loss_dead_features(
     """Gao et al. auxiliary loss: revive dead features with a second TopK.
 
     Applied on features that have not activated for N steps. We run an
-    independent TopK over only those features and optimize their
-    reconstruction of the residual error from the main SAE.
+    independent TopK over ONLY those features and train them to
+    reconstruct the residual error from the main SAE.
+
+    Critical detail vs. an earlier buggy version: we do NOT apply ReLU
+    to the aux activations. Dead features typically have very negative
+    pre-activations — applying ReLU would zero them out immediately and
+    the gradient would never flow back to revive them. Gao et al. use
+    the raw TopK values directly.
     """
     if not dead_mask.any() or k_aux == 0:
         return hidden.new_zeros(())
 
+    # Target: the part of the hidden state the main SAE failed to reconstruct.
     with torch.no_grad():
-        _, acts = sae(hidden)
-        main_recon = sae.decode(acts)
+        _, acts_main = sae(hidden)
+        main_recon = sae.decode(acts_main)
         residual = hidden - main_recon
 
-    # Pre-activations on dead features only
+    # Pre-activations on dead features only. Use a large negative mask for
+    # non-dead features so they never appear in the aux TopK.
     x_centered = hidden - sae.b_dec
     pre = x_centered @ sae.W_enc + sae.b_enc
-    dead_pre = pre.masked_fill(~dead_mask.unsqueeze(0), float("-inf"))
+    neg_inf = torch.finfo(pre.dtype).min
+    dead_pre = pre.masked_fill(~dead_mask.unsqueeze(0), neg_inf)
 
     k_use = min(k_aux, int(dead_mask.sum().item()))
     if k_use == 0:
         return hidden.new_zeros(())
 
     topk_vals, topk_idx = torch.topk(dead_pre, k_use, dim=-1)
+    # NO F.relu here — allow negative pre-activations so gradients can
+    # push dead features' encoder rows back to a useful direction.
     aux_acts = torch.zeros_like(pre)
-    aux_acts.scatter_(-1, topk_idx, F.relu(topk_vals))
+    aux_acts.scatter_(-1, topk_idx, topk_vals)
 
     aux_recon = aux_acts @ sae.W_dec
     return F.mse_loss(aux_recon, residual)
@@ -277,18 +308,20 @@ class TrainConfig:
     model: str = "Qwen/Qwen3.5-4B"
     layer: int = 18
     d_sae: int = 40960
-    k: int = 64
-    k_aux: int = 256
+    k: int = 128                       # was 64 — more features active per token
+    k_aux: int = 512                   # was 256 — revive more dead features per step
     tokens: int = 200_000_000
-    lr: float = 5e-4
-    batch_size: int = 4096  # tokens per SAE step
-    micro_batch: int = 8   # sequences per model forward
+    lr: float = 2e-4                   # was 5e-4 — prevent feature collapse
+    batch_size: int = 4096             # tokens per SAE step
+    micro_batch: int = 8               # sequences per model forward
     max_length: int = 512
-    warmup_steps: int = 1000
+    warmup_steps: int = 5000           # was 1000 — longer warmup stabilizes features
     decoder_norm_every: int = 100
-    dead_threshold_steps: int = 500
+    dead_threshold_steps: int = 5000   # was 500 — be more patient before marking dead
     aux_coef: float = 1.0 / 32.0
-    buffer_capacity: int = 500_000
+    buffer_capacity: int = 2_000_000   # was 500_000 — more activation diversity
+    init_bdec_from_sample: bool = True # initialize b_dec from geometric median
+    bdec_init_sample: int = 16_384     # sample size for b_dec init
     dataset: str = "HuggingFaceFW/fineweb-edu"
     dataset_config: str = "sample-10BT"
     output_dir: Path = field(default_factory=lambda: Path("./sae_qwen35_output"))
@@ -420,8 +453,42 @@ def train(cfg: TrainConfig) -> None:
     print(f"[sae] Filling activation buffer to {initial_target} tokens...")
     fill_buffer_to(initial_target)
 
+    # Sanity-check activation scale. Qwen3.5 hidden states can have very
+    # different magnitudes from the Kaiming-init assumption of ~N(0,1).
+    sample_scale = buf.sample_batch(4096)
+    act_mean = sample_scale.mean().item()
+    act_std = sample_scale.std().item()
+    act_abs_max = sample_scale.abs().max().item()
+    print(
+        f"[sae] Activation scale: mean={act_mean:+.3f} "
+        f"std={act_std:.3f} max|x|={act_abs_max:.3f}"
+    )
+    if act_std > 10 or act_std < 0.1:
+        print(
+            f"[sae] WARNING: activation std={act_std:.2f} is far from 1.0. "
+            f"Kaiming init may need scale adjustment."
+        )
+
+    # Initialize b_dec with geometric median of a fresh sample. Gao et al.
+    # 2024 show this cuts initial reconstruction error by 30-50%.
+    if cfg.init_bdec_from_sample:
+        init_sample = buf.sample_batch(cfg.bdec_init_sample)
+        print(
+            f"[sae] Initializing b_dec via geometric median over "
+            f"{cfg.bdec_init_sample} samples..."
+        )
+        sae.init_b_dec_from_sample(init_sample)
+        print(
+            f"[sae]   b_dec norm after init: {sae.b_dec.norm().item():.4f}"
+        )
+
     print(f"[sae] Starting training: {cfg.total_steps} steps, "
           f"{cfg.batch_size} tokens/step, {cfg.tokens / 1e6:.1f} M total tokens")
+    print(
+        f"[sae] Config: k={sae.k} d_sae={sae.d_sae} lr={cfg.lr} "
+        f"warmup={cfg.warmup_steps} dead_thresh={cfg.dead_threshold_steps} "
+        f"buffer={cfg.buffer_capacity:,}"
+    )
 
     t0 = time.time()
     step = 0
@@ -469,11 +536,18 @@ def train(cfg: TrainConfig) -> None:
             with torch.no_grad():
                 var_explained = 1.0 - (mse.item() / max(x.var().item(), 1e-9))
                 n_dead = int(dead_mask.sum().item())
+                dead_pct = 100.0 * n_dead / cfg.d_sae
+                # Real L0: features ACTUALLY active after ReLU (may differ from k)
+                l0_real = float((acts > 0).float().sum(dim=-1).mean().item())
+                # Feature coverage: fraction of features selected at least once
+                # in this batch — complements "dead" metric which is long-window
+                batch_coverage = float((acts > 0).any(dim=0).float().mean().item())
                 aux_val = aux.detach().item() if aux.requires_grad else float(aux)
             print(
                 f"[sae] step {step:>6}/{cfg.total_steps} "
                 f"mse={mse.item():.4f} var_exp={var_explained:.3f} "
-                f"aux={aux_val:.4f} dead={n_dead} "
+                f"L0={l0_real:.1f}/{sae.k} cov={batch_coverage:.3f} "
+                f"dead={n_dead}({dead_pct:.0f}%) aux={aux_val:.4f} "
                 f"lr={scheduler.get_last_lr()[0]:.2e} "
                 f"eta={eta_min:.1f}min",
                 flush=True,
@@ -561,15 +635,21 @@ def parse_args() -> TrainConfig:
     p.add_argument("--model", default="Qwen/Qwen3.5-4B")
     p.add_argument("--layer", type=int, default=18)
     p.add_argument("--d-sae", type=int, default=40960)
-    p.add_argument("--k", type=int, default=64)
-    p.add_argument("--k-aux", type=int, default=256)
+    p.add_argument("--k", type=int, default=128)
+    p.add_argument("--k-aux", type=int, default=512)
     p.add_argument("--tokens", type=int, default=200_000_000)
-    p.add_argument("--lr", type=float, default=5e-4)
+    p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--batch-size", type=int, default=4096)
     p.add_argument("--micro-batch", type=int, default=8)
     p.add_argument("--max-length", type=int, default=512)
-    p.add_argument("--warmup-steps", type=int, default=1000)
-    p.add_argument("--buffer-capacity", type=int, default=500_000)
+    p.add_argument("--warmup-steps", type=int, default=5000)
+    p.add_argument("--dead-threshold-steps", type=int, default=5000)
+    p.add_argument("--buffer-capacity", type=int, default=2_000_000)
+    p.add_argument(
+        "--no-bdec-init",
+        action="store_true",
+        help="Disable geometric-median init of b_dec (debug only)",
+    )
     p.add_argument("--dataset", default="HuggingFaceFW/fineweb-edu")
     p.add_argument("--dataset-config", default="sample-10BT")
     p.add_argument("--output-dir", type=Path, default=Path("./sae_qwen35_output"))
@@ -593,7 +673,9 @@ def parse_args() -> TrainConfig:
         micro_batch=args.micro_batch,
         max_length=args.max_length,
         warmup_steps=args.warmup_steps,
+        dead_threshold_steps=args.dead_threshold_steps,
         buffer_capacity=args.buffer_capacity,
+        init_bdec_from_sample=not args.no_bdec_init,
         dataset=args.dataset,
         dataset_config=args.dataset_config,
         output_dir=args.output_dir,

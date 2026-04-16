@@ -96,7 +96,7 @@ GRPO on 500 GSM8K train questions, 100 steps, 4 rollouts/question, LR=1e-6, KL p
 |---|---|---|---|---|
 | R0 | Outcome only | 74 % | +10 pp | — |
 | **R1** | **Outcome + SAE features (λ=0.1)** | **76 %** | **+12 pp** | **+2 pp ✅ (C2 met)** |
-| R2 | Outcome + raw direction (λ=0.1) | *running* | *early: −3 pp* | *negative* |
+| R2 | Outcome + raw direction (λ=0.1) | **65 %** | **+1 pp** | **−9 pp ❌ (harmful)** |
 
 **Key finding**: R1 reached 74 % at step 40; R0 needed all 100 steps → **2.5× faster convergence**. R0 dropped from its peak (76 % → 74 %) while R1 held stable (75 % → 76 %), suggesting SAE features act as a late-training regularizer.
 

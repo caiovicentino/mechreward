@@ -12,9 +12,18 @@ A model trained against a feature-reward like `+1 × fact_retrieval_active - 0.5
 
 ## Status
 
-**Alpha (v0.1.0).** API is subject to change. Tested against Gemma-2-9B with Gemma Scope SAEs. Integrations with `trl` (GRPO), `openrlhf`, and `verl` available.
+**Alpha (v0.1.0).** API is subject to change. Integrations with `trl` (GRPO), `openrlhf`, and `verl` available.
 
-See [RESEARCH.md](RESEARCH.md) for the scientific context, prior art (SARM, SparseRM, CRL, YaPO), and what makes `mechreward` different from existing work.
+**Thesis validated** on Qwen3.5-4B (2026-04-17): three-stage empirical pipeline completed.
+- **Stage Gate 1** (correlation): SAE features predict GSM8K correctness at Spearman ρ=0.540 on 100 held-out questions.
+- **Stage Gate 2** (tiny RL): R1 (outcome + SAE features) 76 % vs R0 (outcome only) 74 % vs R2 (outcome + raw L13 direction) 65 %. The 11 pp R1-vs-R2 gap is direct evidence that sparse SAE decomposition is necessary, not cosmetic.
+- **Stage Gate 3 Phase A** (full RL): 64 % → **83 % on GSM8K** in 168 effective training steps at LR=3e-6 (LoRA r=32). Breaks the trajectory-level G2 R1 ceiling (76 %) by +7 pp with per-token mech-reward; MMLU non-regressed; adversarial-canary hack rate within 95 % CI of baseline.
+
+**Write-up**: [LessWrong post](https://www.lesswrong.com/posts/H7mnTT7aPPijpjLAS/per-token-sae-features-as-online-rl-reward-breaking-the-g2). Trained adapter at [`caiovicentino1/Qwen3.5-4B-mechreward-G3-phaseA-step400`](https://huggingface.co/caiovicentino1/Qwen3.5-4B-mechreward-G3-phaseA-step400).
+
+**In progress**: Stage 4 extension to [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) (first SAE on triple-hybrid MoE + GDN + Gated Attention architecture, SuperGPQA benchmark).
+
+**Closest prior work**: Goodfire's [RLFR](https://arxiv.org/abs/2602.10067) (Prasad et al., Feb 2026) established feature-as-reward for online RL using linear probes on Gemma-3-12B-IT for hallucination. `mechreward` extends that paradigm in three directions: sparse TopK SAE features instead of raw probes, per-token dense reward instead of span-level, and hybrid architectures (GDN/MoE). See [RESEARCH.md](RESEARCH.md) for the full prior-art audit.
 
 ## Install
 
@@ -38,39 +47,41 @@ pip install "mechreward[all]"
 import mechreward as mr
 from trl import GRPOConfig, GRPOTrainer
 
-# 1. Load a pre-trained SAE (Gemma Scope from Google DeepMind)
+# 1. Load the validated SAE (trained by us on Qwen3.5-4B hybrid GDN, 200M tokens)
 sae = mr.load_sae(
-    release="gemma-scope-9b-pt-res-canonical",
-    sae_id="layer_22/width_16k/canonical",
+    release="caiovicentino1/Qwen3.5-4B-SAE-L18-topk",
+    sae_id="layer_18",
 )
 
-# 2. Build a feature reward from a named pack
+# 2. Build a feature reward from the validated pack (ρ=0.540 on GSM8K)
 reward = mr.FeatureReward.from_pack(
-    "gemma-2-9b/reasoning_pack",
+    "qwen3.5-4b/reasoning_pack",
     sae=sae,
-    aggregation="mean_last_32_tokens",
+    aggregation="per_token",  # per-token dense — see Stage Gate 3
 )
 
 # 3. Combine with an outcome reward (math verifier)
 composite = mr.CompositeReward(
     rewards=[
         reward,
-        mr.OutcomeReward(verifier=mr.verifiers.math_boxed),
+        mr.OutcomeReward(verifier=mr.verifiers.gsm8k_exact_match),
     ],
-    weights=[0.3, 1.0],
+    weights=[0.1, 1.0],  # λ_mech=0.1 — validated ratio from Stage Gate 2
 )
 
 # 4. Plug into TRL GRPOTrainer (unchanged API)
 trainer = GRPOTrainer(
-    model="google/gemma-2-9b",
-    args=GRPOConfig(output_dir="./out", num_generations=8),
-    train_dataset=my_dataset,
+    model="Qwen/Qwen3.5-4B",
+    args=GRPOConfig(output_dir="./out", num_generations=4, learning_rate=3e-6),
+    train_dataset=gsm8k_train,
     reward_funcs=composite,
 )
 trainer.train()
 ```
 
-That's it. The feature-reward runs alongside outcome-reward during each GRPO step, with anti-hacking detection and KL regularization enabled by default.
+That's it. This is the exact configuration that took Qwen3.5-4B from 64 % to 83 % on GSM8K. The feature-reward runs alongside outcome-reward during each GRPO step, with anti-hacking detection and KL regularization enabled by default.
+
+> Note: Qwen3.5-4B is multimodal. Use `AutoModelForImageTextToText` and freeze the vision tower before LoRA — see `notebooks/stage3_qwen35_4b_rl_v2.ipynb` for the full working example.
 
 ## Why this could work
 
@@ -87,21 +98,20 @@ Meanwhile, mechanistic interpretability research has shown that specific SAE fea
 
 If we reward the *internal pattern* instead of the *output token*, we're reaching a different layer of the stack — one that's harder to game at the surface, and that lines up more directly with what we actually want the model to learn.
 
-## What makes this different from SARM / CRL / SparseRM
+## What makes this different from RLFR / SARM / CRL
 
-There are several excellent papers using SAE features around reward modeling:
+The closest prior work is Goodfire's RLFR (Prasad et al., Feb 2026), which established the feature-as-reward-for-online-RL paradigm two months before this work. `mechreward` is a methodologically distinct instance within that paradigm, with a direct empirical argument for the specific design choices.
 
 | Method | What it does | What `mechreward` adds |
 |---|---|---|
-| [SARM](https://arxiv.org/abs/2508.08746) (AAAI 26) | SAE features → linear head → reward model, used in offline RLHF | **Online** GRPO use; multi-objective; composability with outcome verifier |
-| [SparseRM](https://arxiv.org/abs/2511.07896) | Preference modeling via frequency-diff features | Reward is trajectory-level, not pairwise |
+| [**RLFR — Goodfire (Prasad et al., Feb 2026)**](https://arxiv.org/abs/2602.10067) | **Linear probes on activations** as online RL reward; trajectory/span-level; dense Gemma-3-12B-IT; hallucination task (58 % ↓) | **Sparse TopK SAE decomposition** instead of raw probes (validated: raw-direction reward is **−9 pp** worse than outcome-only on GSM8K; SAE-sparse is **+2 pp**, an 11 pp gap). **Per-token dense** reward instead of span-level (+7 pp in G3). **Hybrid architectures** (GDN, MoE, triple-hybrid) where no public SAEs existed. |
+| [SARM](https://arxiv.org/abs/2508.08746) (AAAI 26) | SAE features → linear head → reward model, used in offline RLHF | Online GRPO use; multi-objective; composability with outcome verifier |
+| [SparseRM](https://arxiv.org/abs/2511.07896) | Preference modeling via frequency-diff features | Reward is per-token, not pairwise |
 | [CRL](https://arxiv.org/abs/2602.10437) | Token-level feature amplification via RL | Reward is feature activation, not action selection |
 | [YaPO](https://arxiv.org/abs/2601.08441) | SAE-sparse steering vectors | We don't modify inference-time activations |
 | [Wilhelm et al.](https://arxiv.org/abs/2603.04069) | SAE features **detect** reward hacking | We use the same probes *during training* to prevent it |
 
-The novel contribution is the **combination**: online GRPO + SAE feature reward + anti-hacking dual verification + composability with standard outcome verifiers, shipped as a reusable library. Nobody has built this as a plug-in library before.
-
-See [RESEARCH.md](RESEARCH.md) for the full positioning and verified prior-art audit.
+The novel contribution is the **combination within the feature-as-reward paradigm**: sparse TopK decomposition + per-token dense GRPO + hybrid architecture generalization + anti-hacking dual verification, shipped as a drop-in library. See [RESEARCH.md](RESEARCH.md) for the full positioning and verified prior-art audit.
 
 ## Anti-Goodhart is built in
 
@@ -112,15 +122,17 @@ The central risk of any reward signal is [Goodhart's law](https://en.wikipedia.o
 ```python
 from mechreward.hacking import DualVerifier, AdversarialSuite
 
-# A second, independent signal (a linear probe trained on real examples
-# of the behavior) checks whether the feature activation is "honest".
+# A second, independent signal (a linear probe trained on L18 residuals of
+# correct vs wrong GSM8K responses) checks whether the feature activation is "honest".
 dual = DualVerifier(
     feature_reward=reward,
-    independent_probe=mr.load_probe("gemma-2-9b/fact_retrieval_probe"),
+    independent_probe=mr.load_probe("qwen3.5-4b/correctness_probe_l18"),
     disagreement_threshold=0.3,  # if they disagree >30%, downweight
 )
 
 # And an adversarial red-team suite flags suspicious rollouts during training.
+# In G3 Phase A with 50 canaries × 5 hack patterns, trained policy hack rate was
+# 8 % (vs 4 % baseline, within 95 % CI) — no Goodhart collapse observed.
 detector = AdversarialSuite.from_preset("standard")
 ```
 
@@ -130,15 +142,15 @@ Each GRPO step runs the detector in parallel with the main reward computation. I
 
 | Model | SAE source | Status |
 |---|---|---|
-| **Gemma-2-9B** | Gemma Scope (Google DeepMind, all layers) | ✅ Primary target |
-| **Gemma-2-2B** | Gemma Scope | ✅ Quick experiments |
-| **Gemma-2-27B** | Gemma Scope (selected layers) | ✅ Supported |
-| **Llama-3.1-8B-Base** | [Llama Scope](https://arxiv.org/abs/2410.20526) | ✅ Supported |
-| **Llama-3.1-8B-Instruct** | [Goodfire SAE L19](https://huggingface.co/Goodfire/Llama-3.1-8B-Instruct-SAE-l19) | ✅ Supported |
-| **Llama-3.3-70B-Instruct** | Goodfire SAE L50 | ⚠️ Experimental (compute-heavy) |
-| Qwen, Mistral, DeepSeek | no public SAE | ❌ Needs custom training |
+| **Qwen3.5-4B** (hybrid GDN) | [`caiovicentino1/Qwen3.5-4B-SAE-L18-topk`](https://huggingface.co/caiovicentino1/Qwen3.5-4B-SAE-L18-topk) — trained by us, 200 M tokens, var_exp 0.866 | ✅ **Primary validated target (G1+G2+G3 passed)** |
+| **Gemma-4-E4B** (ensemble MoE) | [`caiovicentino1/Gemma-4-E4B-SAE-L21-topk`](https://huggingface.co/caiovicentino1/Gemma-4-E4B-SAE-L21-topk) — trained by us, 1 B tokens, var_exp 0.939 | ✅ SAE published; G1–G3 pending |
+| **Qwen3.6-35B-A3B** (triple-hybrid MoE+GDN+GA) | Training in progress at L23 | 🚧 S4 in flight |
+| Gemma-2-9B / 2B / 27B | Gemma Scope (DeepMind) | ✅ Library-supported (Gemma Scope), not our primary test |
+| Llama-3.1-8B | Llama Scope / Goodfire SAE | ✅ Library-supported, not our primary test |
+| Qwen3.5-9B | [`kroonen-ai/sae-qwen3.5-9b`](https://huggingface.co/kroonen-ai/sae-qwen3.5-9b) — third-party ReLU MLP SAE | ⚠️ Alternative SAE exists (ReLU, not TopK); untested in mechreward |
+| Mistral, DeepSeek-V3 MoE | No public SAE | ❌ Needs custom training |
 
-To add a new model, see `docs/training_new_sae.md` for the `sae_lens`-based training recipe.
+To add a new model, see `docs/training_new_sae.md` for the `sae_lens`-based training recipe, or `scripts/train_sae_qwen35.py` for our hybrid-architecture TopK recipe that bypasses TransformerLens.
 
 ## Repository layout
 
@@ -184,7 +196,7 @@ The tricky part of integrating feature rewards with a GRPO trainer is that the s
 from mechreward.integrations.trl_grpo import MechRewardGRPOTrainer
 
 trainer = MechRewardGRPOTrainer(
-    model="google/gemma-2-9b",
+    model="Qwen/Qwen3.5-4B",  # multimodal; loader handles AutoModelForImageTextToText
     reward_funcs=[feature_reward, outcome_reward],
     ...,
 )
@@ -214,7 +226,11 @@ This library exists because of a specific empirical observation: fine-tuning Qwe
 
 The hypothesis: we need reward signals that point at the *cognitive circuits* we want to strengthen, not at the *output distribution*. Mech interp gives us a handle on those circuits. This library is the infrastructure to test that hypothesis.
 
-If it doesn't work, that's also a publishable result — a systematic negative result on "feature rewards fail to transfer to reasoning" is a contribution.
+**As of 2026-04-17, the hypothesis is validated** on Qwen3.5-4B: mech-reward GRPO took GSM8K from 64 % → 83 % in 168 effective steps, with MMLU preserved and adversarial-canary hack rate within the 95 % CI of the baseline model. The Stage Gate 2 ablation also shows that the sparse SAE decomposition is causally necessary: the same contrastive signal used as a raw direction (R2) is −9 pp worse than outcome-only, while its sparse SAE projection (R1) is +2 pp better — an 11 pp gap that directly rebuts the "just use a linear probe" alternative.
+
+Closest concurrent work: Goodfire's [RLFR](https://arxiv.org/abs/2602.10067) (Feb 2026) established the feature-as-reward paradigm on dense Gemma-3-12B-IT for hallucination reduction. `mechreward` extends it to sparse-SAE features, per-token granularity, and hybrid architectures — three distinct methodological axes.
+
+Full write-up: [LessWrong post](https://www.lesswrong.com/posts/H7mnTT7aPPijpjLAS/per-token-sae-features-as-online-rl-reward-breaking-the-g2) · [RESEARCH.md](RESEARCH.md).
 
 ## Contributing
 

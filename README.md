@@ -1,6 +1,32 @@
-# mechreward
+<div align="center">
 
-**Mechanistic interpretability as a reward signal for RL training of LLMs.**
+# `mechreward`
+
+### Mechanistic interpretability as a reward signal for RL training of LLMs.
+
+**+19 pp on GSM8K** (Qwen3.5-4B, 64 % → 83 % in 168 effective steps). Stage Gate 1 → 2 → 3 validated on hybrid Gated Delta Networks.
+
+[![PyPI](https://img.shields.io/pypi/v/mechreward.svg?color=8b5cf6)](https://pypi.org/project/mechreward/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
+[![License Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-green)](./LICENSE)
+[![openinterp.org](https://img.shields.io/badge/site-openinterp.org-8b5cf6)](https://openinterp.org)
+[![Discussions](https://img.shields.io/github/discussions/OpenInterpretability/mechreward)](https://github.com/OpenInterpretability/mechreward/discussions)
+
+</div>
+
+---
+
+## Part of a 5-repo ecosystem
+
+| Repo | What's in it |
+|---|---|
+| [`.github`](https://github.com/OpenInterpretability/.github) | Org profile + shared CoC + SECURITY |
+| [`web`](https://github.com/OpenInterpretability/web) | Next.js site behind openinterp.org |
+| [`notebooks`](https://github.com/OpenInterpretability/notebooks) | 23 training + interpretability notebooks (incl. `11_stage_gate_g1.ipynb`) |
+| [`cli`](https://github.com/OpenInterpretability/cli) | `pip install openinterp` — Python SDK |
+| **`mechreward`** (you are here) | SAE features as dense RL reward |
+
+---
 
 Most RL-for-reasoning methods reward the *output*: "did the final answer match?" (outcome reward), "did each step look correct?" (PRM), "did a judge like it?" (LLM-as-judge).
 
@@ -234,7 +260,17 @@ Full write-up: [LessWrong post](https://www.lesswrong.com/posts/H7mnTT7aPPijpjLA
 
 ## Contributing
 
-This is alpha software. Issues and PRs welcome, but expect rapid breakage. See [CONTRIBUTING.md](CONTRIBUTING.md).
+Alpha software — expect rapid breakage. Issues + PRs welcome.
+
+### 3 high-leverage contribution paths
+
+**1. Port Stage Gate protocol to a new model.** G1 correlation pre-test takes ~30 min on a T4; if you get ρ ≥ 0.30, that's a signed contribution. See [`notebooks/stage_gate_g1.ipynb`](https://github.com/OpenInterpretability/notebooks/blob/main/notebooks/11_stage_gate_g1.ipynb) in the sibling repo. Good candidates: CodeLlama-7B on HumanEval, DeepSeek-R1-Distill on AIME, Gemma-4-E4B on anything.
+
+**2. Submit a feature pack.** A pack is a `catalogs/<model>/<task>_pack.json` with 10 helpful + 10 harmful feature IDs + validated G1 ρ. Template: [`catalogs/TEMPLATE/`](./catalogs/). PR title: `Add feature pack: <model>/<task>`.
+
+**3. Reproduce a baseline.** We've re-implemented SARM, CRL, and ReasonScore for apples-to-apples comparison — see `experiments/04_*`, `experiments/05_*`, etc. If you spot a discrepancy with the original paper, open an issue with the specific number.
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for full rules. Good-first-issues labeled in [the tracker](https://github.com/OpenInterpretability/mechreward/issues?q=is%3Aopen+is%3Aissue+label%3A%22good+first+issue%22).
 
 ## Citation
 
@@ -249,9 +285,16 @@ If you use `mechreward` in research, please cite:
 }
 ```
 
+## Community
+
+- 💬 [Discussions](https://github.com/OpenInterpretability/mechreward/discussions) — "why did my pack fail G1?" etc.
+- 🟢 [Good-first-issues](https://github.com/OpenInterpretability/mechreward/issues?q=is%3Aopen+is%3Aissue+label%3A%22good+first+issue%22)
+- 📖 Full openinterp.org research section: [openinterp.org/research](https://openinterp.org/research)
+- ✉️ hi@openinterp.org
+
 ## License
 
-Apache 2.0. See [LICENSE](LICENSE).
+Apache 2.0 for code. See [LICENSE](./LICENSE).
 
 ## Related projects
 

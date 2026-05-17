@@ -1,20 +1,8 @@
-<div align="center">
+# `mechreward` — mechanistic interpretability as RL reward for LLMs
 
-# `mechreward`
++19 pp on GSM8K (Qwen3.5-4B, 64% → 83% in 168 effective steps). Stage Gate 1 → 2 → 3 validated on hybrid Gated Delta Networks.
 
-### Mechanistic interpretability as a reward signal for RL training of LLMs.
-
-**+19 pp on GSM8K** (Qwen3.5-4B, 64 % → 83 % in 168 effective steps). Stage Gate 1 → 2 → 3 validated on hybrid Gated Delta Networks.
-
-[![PyPI](https://img.shields.io/pypi/v/mechreward.svg?color=8b5cf6)](https://pypi.org/project/mechreward/)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
-[![License Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-green)](./LICENSE)
-[![openinterp.org](https://img.shields.io/badge/site-openinterp.org-8b5cf6)](https://openinterp.org)
-[![Discussions](https://img.shields.io/github/discussions/OpenInterpretability/mechreward)](https://github.com/OpenInterpretability/mechreward/discussions)
-
-</div>
-
----
+[![PyPI](https://img.shields.io/pypi/v/mechreward.svg)](https://pypi.org/project/mechreward/) · Python ≥ 3.10 · Apache-2.0
 
 ## Part of a 5-repo ecosystem
 
